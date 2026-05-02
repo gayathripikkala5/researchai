@@ -276,21 +276,83 @@ def build_summary(title: str, abstract: str, extracted_text: str | None) -> str:
         parsed = parse_uploaded_paper_metadata(extracted_text, title)
         abstract = str(parsed["abstract"] or abstract)
     sentences = split_sentences(abstract)
-    chosen = []
-    for matcher in [
-        lambda s: "we propose" in s.lower() or "we develop" in s.lower(),
-        lambda s: "graph structure" in s.lower() or "embedding process" in s.lower() or "framework" in s.lower(),
-        lambda s: "experiments" in s.lower() or "demonstrating" in s.lower() or "improvements" in s.lower(),
-    ]:
-        sentence = next((s for s in sentences if matcher(s) and s not in chosen), None)
-        if sentence:
-            chosen.append(sentence)
-    highlights = chosen or sentences[:3] or [abstract]
-    bullets = " ".join(f"{index + 1}. {sentence}" for index, sentence in enumerate(highlights))
-    return (
-        f"Summary for {title}: {bullets} "
-        "This summary is generated from the paper abstract and extracted PDF content."
+    cleaned_abstract = " ".join(abstract.split())
+    first = sentences[0] if sentences else cleaned_abstract
+
+    problem_sentence = next(
+        (
+            s
+            for s in sentences
+            if any(
+                phrase in s.lower()
+                for phrase in [
+                    "existing",
+                    "challenge",
+                    "problem",
+                    "task",
+                    "language representation",
+                    "sequence",
+                ]
+            )
+        ),
+        first,
     )
+    method_sentence = next(
+        (
+            s
+            for s in sentences
+            if any(
+                phrase in s.lower()
+                for phrase in [
+                    "we introduce",
+                    "we propose",
+                    "we present",
+                    "model",
+                    "architecture",
+                    "framework",
+                    "pre-train",
+                ]
+            )
+        ),
+        first,
+    )
+    impact_sentence = next(
+        (
+            s
+            for s in sentences
+            if any(
+                phrase in s.lower()
+                for phrase in [
+                    "improves",
+                    "outperforms",
+                    "results",
+                    "performance",
+                    "demonstrate",
+                    "state-of-the-art",
+                    "effective",
+                ]
+            )
+        ),
+        "",
+    )
+
+    if not cleaned_abstract:
+        return f"{title} explores an academic problem, proposes a method, and reports its main contribution in the paper."
+
+    summary_parts = [
+        f"{title} addresses the problem that {problem_sentence[0].lower() + problem_sentence[1:] if len(problem_sentence) > 1 else problem_sentence.lower()}",
+        f"The core idea is that {method_sentence[0].lower() + method_sentence[1:] if len(method_sentence) > 1 else method_sentence.lower()}",
+    ]
+    if impact_sentence and impact_sentence not in {problem_sentence, method_sentence}:
+        summary_parts.append(
+            f"The paper reports that {impact_sentence[0].lower() + impact_sentence[1:] if len(impact_sentence) > 1 else impact_sentence.lower()}"
+        )
+    else:
+        summary_parts.append(
+            "Overall, the contribution is important because it provides a stronger foundation for future work in this area."
+        )
+
+    return " ".join(part.rstrip(".") + "." for part in summary_parts)
 
 
 def call_openai_assistant(message: str, paper_context: str | None = None) -> str | None:
