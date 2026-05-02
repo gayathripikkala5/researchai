@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sqlite3
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -412,6 +413,96 @@ def first_sentence(text: str, fallback: str) -> str:
     return sentence or fallback
 
 
+def explain_general_concept(message: str) -> str | None:
+    lower_message = message.lower()
+
+    if "attention is all you need" in lower_message:
+        return (
+            "'Attention Is All You Need' is the 2017 paper that introduced the Transformer architecture. "
+            "Its main idea is that sequence modeling can rely entirely on attention mechanisms instead of recurrence or convolution. "
+            "That made training more parallelizable and became the foundation for modern large language models."
+        )
+    if "attention" in lower_message:
+        return (
+            "Attention is a mechanism that lets a model decide which words or tokens matter most while processing a sentence. "
+            "Instead of reading strictly one step at a time, the model can weigh relationships between all tokens and focus on the most relevant ones. "
+            "In Transformers, this is what helps the model capture long-range context efficiently."
+        )
+    if "transformer" in lower_message or "transformers" in lower_message:
+        return (
+            "A Transformer is a neural network architecture built around attention. "
+            "It processes tokens in parallel, learns relationships between them, and scales well to large datasets, which is why it became the base architecture for models like BERT and GPT."
+        )
+    if "bert" in lower_message:
+        return (
+            "BERT is a bidirectional Transformer model for language understanding. "
+            "Its key idea is to pre-train on large text corpora and learn context from both the left and right side of a word, which makes it strong at tasks like classification, question answering, and sentence understanding."
+        )
+    if "gpt" in lower_message or "language model" in lower_message or "llm" in lower_message:
+        return (
+            "A large language model is a neural network trained to predict the next token in text. "
+            "By learning from massive datasets, it can generate text, summarize information, answer questions, and perform many language tasks."
+        )
+    if "rag" in lower_message or "retrieval-augmented generation" in lower_message:
+        return (
+            "RAG stands for Retrieval-Augmented Generation. Instead of answering only from a model's internal memory, "
+            "it retrieves relevant text from documents first and then generates an answer grounded in that retrieved context."
+        )
+    if "tokenization" in lower_message or "tokenization" in lower_message:
+        return (
+            "Tokenization is the step where text is split into smaller units called tokens. "
+            "Models read and generate tokens rather than full sentences all at once."
+        )
+    if "generative ai" in lower_message or "gen ai" in lower_message:
+        return (
+            "Generative AI refers to systems that create new content such as text, code, images, or audio based on patterns learned from data. "
+            "Large language models are one example because they generate new text responses from prompts."
+        )
+    return None
+
+
+def explain_from_paper_context(message: str, paper_title: str, abstract: str, extracted_text: str | None) -> str | None:
+    lower_message = message.lower()
+    source_text = extracted_text or abstract or ""
+    concept_answer = explain_general_concept(message)
+
+    if "what is attention" in lower_message or "explain attention" in lower_message:
+        return (
+            f"In the context of '{paper_title}', attention is the core mechanism that lets the model focus on the most relevant parts of an input sequence when processing each token. "
+            "The paper's contribution is showing that attention alone can replace recurrence and convolution for sequence transduction. "
+            + (concept_answer or "")
+        ).strip()
+
+    if "what is this paper about" in lower_message or "paper about" in lower_message or "main idea" in lower_message:
+        return (
+            f"'{paper_title}' is mainly about this idea: {first_sentence(abstract, abstract)} "
+            "In short, the paper introduces the core approach, explains why it is useful, and reports why it improves on earlier methods."
+        )
+
+    if "summary" in lower_message or "summarize" in lower_message:
+        return build_summary(paper_title, abstract, extracted_text)
+
+    if ("explain" in lower_message or "what is" in lower_message) and concept_answer:
+        return (
+            f"Using '{paper_title}' as context: {concept_answer} "
+            f"The most relevant line from the paper is: {first_sentence(source_text, abstract)}"
+        )
+
+    return None
+
+
+def match_library_paper(message: str, library_rows) -> sqlite3.Row | None:
+    lower_message = message.lower()
+    for row in library_rows:
+        title = row["title"].lower()
+        if title in lower_message:
+            return row
+        title_tokens = [token for token in re.findall(r"[a-z0-9]+", title) if len(token) >= 4]
+        if title_tokens and all(token in lower_message for token in title_tokens[:2]):
+            return row
+    return None
+
+
 def get_paper_or_404(paper_id: int):
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
@@ -677,6 +768,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
     lower_message = message.lower()
+    answer = ""
     if payload.paper_id:
         with get_connection() as conn:
             paper = conn.execute("SELECT * FROM papers WHERE id = ?", (payload.paper_id,)).fetchone()
@@ -686,14 +778,33 @@ def chat(payload: ChatRequest) -> ChatResponse:
             llm_answer = call_gemini_assistant(message, paper_context=source[:8000]) or call_openai_assistant(message, paper_context=source[:8000])
             if llm_answer:
                 answer = llm_answer
+            else:
+                guided_answer = explain_from_paper_context(
+                    message,
+                    paper["title"],
+                    paper["abstract"],
+                    paper["extracted_text"],
+                )
+                if guided_answer:
+                    answer = guided_answer
+                elif "simple" in lower_message or "explain" in lower_message:
+                    answer = (
+                        f"In simple terms, '{paper['title']}' is about this idea: {paper['abstract']} "
+                        "It matters because it helps researchers understand the method, result, or direction more quickly."
+                    )
+                else:
+                    answer = (
+                        f"Based on '{paper['title']}', the most relevant content I found is: {snippet} "
+                        "For the demo, this answer is generated from the stored paper abstract or extracted PDF text."
+                    )
             if "summary" in lower_message or "summarize" in lower_message:
                 answer = build_summary(paper["title"], paper["abstract"], paper["extracted_text"])
-            elif "simple" in lower_message or "explain" in lower_message:
+            elif not llm_answer and ("simple" in lower_message and "what is" not in lower_message):
                 answer = (
                     f"In simple terms, '{paper['title']}' is about this idea: {paper['abstract']} "
                     "It matters because it helps researchers understand the method, result, or direction more quickly."
                 )
-            elif not llm_answer:
+            elif not llm_answer and not answer:
                 answer = (
                     f"Based on '{paper['title']}', the most relevant content I found is: {snippet} "
                     "For the demo, this answer is generated from the stored paper abstract or extracted PDF text."
@@ -711,6 +822,16 @@ def chat(payload: ChatRequest) -> ChatResponse:
             recommended = conn.execute(
                 "SELECT title FROM papers WHERE status = 'Recommended' ORDER BY citations DESC LIMIT 3"
             ).fetchall()
+        matched_paper = match_library_paper(message, library)
+        concept_answer = explain_general_concept(message)
+        if not llm_answer and matched_paper:
+            answer = (
+                f"'{matched_paper['title']}' is one of the key papers in your library. "
+                f"Main idea: {first_sentence(matched_paper['abstract'], matched_paper['abstract'])} "
+                "Open that paper from My Papers if you want a more grounded, paper-specific chat."
+            )
+        elif not llm_answer and concept_answer:
+            answer = concept_answer
         if not llm_answer and ("rag" in lower_message or "retrieval-augmented generation" in lower_message):
             answer = (
                 "RAG stands for Retrieval-Augmented Generation. Instead of answering only from a model's internal memory, "
