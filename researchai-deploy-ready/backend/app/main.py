@@ -1,4 +1,8 @@
 import os
+import json
+import re
+import urllib.request
+import urllib.error
 from pathlib import Path
 from shutil import copyfileobj
 from uuid import uuid4
@@ -25,6 +29,21 @@ from .schemas import (
 
 app = FastAPI(title="ResearchAI API")
 
+
+def load_local_env() -> None:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+load_local_env()
+
 cors_origins = [
     origin.strip()
     for origin in os.getenv(
@@ -50,13 +69,27 @@ def startup() -> None:
 
 
 def row_to_paper(row) -> Paper:
+    title = row["title"]
+    authors = row["authors"]
+    year = row["year"]
+    abstract = row["abstract"]
+    tags = [tag.strip() for tag in row["tags"].split(",") if tag.strip()]
+
+    if row["source"] == "Local Upload" and row["extracted_text"]:
+        parsed = parse_uploaded_paper_metadata(row["extracted_text"], title)
+        title = parsed["title"] or title
+        authors = parsed["authors"] or authors
+        year = parsed["year"] or year
+        abstract = parsed["abstract"] or abstract
+        tags = parsed["tags"] or tags
+
     return Paper(
         id=row["id"],
-        title=row["title"],
-        authors=row["authors"],
-        year=row["year"],
-        abstract=row["abstract"],
-        tags=[tag.strip() for tag in row["tags"].split(",") if tag.strip()],
+        title=title,
+        authors=authors,
+        year=year,
+        abstract=abstract,
+        tags=tags,
         citations=row["citations"],
         status=row["status"],
         source=row["source"],
@@ -102,6 +135,119 @@ def extract_pdf_text(path: Path) -> str:
         return ""
 
 
+def normalize_pdf_text(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = text.replace("-\n", "")
+    lines = [line.strip() for line in text.splitlines()]
+    cleaned = []
+    for line in lines:
+        if not line:
+            cleaned.append("")
+            continue
+        cleaned.append(" ".join(line.split()))
+    return "\n".join(cleaned)
+
+
+def extract_section(text: str, start_markers: list[str], end_markers: list[str]) -> str:
+    upper = text.upper()
+    start_index = -1
+    for marker in start_markers:
+        idx = upper.find(marker.upper())
+        if idx != -1 and (start_index == -1 or idx < start_index):
+            start_index = idx + len(marker)
+    if start_index == -1:
+        return ""
+
+    end_index = len(text)
+    search_region = upper[start_index:]
+    for marker in end_markers:
+        idx = search_region.find(marker.upper())
+        if idx != -1:
+            end_index = min(end_index, start_index + idx)
+    return text[start_index:end_index].strip(" \n:-")
+
+
+def split_sentences(text: str) -> list[str]:
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return []
+    cleaned = cleaned.replace("aka.", "aka").replace("i.e.", "ie").replace("e.g.", "eg")
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+(?=[A-Z])", cleaned) if part.strip()]
+    return parts
+
+
+def looks_like_author_name(line: str) -> bool:
+    if "@" in line or "UNIVERSITY" in line.upper() or len(line.split()) < 2 or len(line.split()) > 4:
+        return False
+    return all(token[:1].isupper() for token in line.replace("-", " ").split() if token)
+
+
+def infer_tags_from_text(title: str, abstract: str, keywords: list[str]) -> list[str]:
+    if keywords:
+        return keywords[:5]
+    haystack = f"{title} {abstract}".lower()
+    tags = []
+    mapping = [
+        ("Graph Neural Network", ["graph neural", "gnn"]),
+        ("Collaborative Filtering", ["collaborative filtering", "cf"]),
+        ("Recommendation", ["recommend", "recommender"]),
+        ("Embeddings", ["embedding"]),
+        ("Transformers", ["transformer"]),
+        ("NLP", ["language", "nlp"]),
+    ]
+    for tag, keywords_for_tag in mapping:
+        if any(keyword in haystack for keyword in keywords_for_tag):
+            tags.append(tag)
+    return tags[:5] or ["Uploaded", "Research Paper"]
+
+
+def parse_uploaded_paper_metadata(extracted_text: str, fallback_title: str) -> dict[str, object]:
+    text = normalize_pdf_text(extracted_text)
+    lines = [line for line in text.splitlines() if line.strip()]
+    title = fallback_title
+    if lines:
+        candidate_title = lines[0].strip(" *")
+        if 5 <= len(candidate_title) <= 180:
+            title = candidate_title
+
+    author_lines = []
+    for line in lines[1:12]:
+        if line.upper() == "ABSTRACT":
+            break
+        if looks_like_author_name(line):
+            author_lines.append(line)
+    authors = ", ".join(dict.fromkeys(author_lines)) if author_lines else "Uploaded PDF"
+
+    abstract = extract_section(
+        text,
+        ["ABSTRACT"],
+        ["CCS CONCEPTS", "KEYWORDS", "ACM REFERENCE FORMAT", "1 INTRODUCTION", "INTRODUCTION"],
+    )
+    abstract = " ".join(abstract.split())
+
+    keywords_text = extract_section(
+        text,
+        ["KEYWORDS"],
+        ["ACM REFERENCE FORMAT", "1 INTRODUCTION", "INTRODUCTION"],
+    )
+    keywords = [part.strip(" .") for part in keywords_text.replace("\n", " ").split(",") if part.strip()]
+
+    year = None
+    for token in text.split():
+        if token.isdigit() and len(token) == 4 and token.startswith(("19", "20")):
+            year = int(token)
+            break
+
+    return {
+        "title": title,
+        "authors": authors,
+        "year": year,
+        "abstract": abstract or preview_text(text, "Uploaded PDF ready for processing."),
+        "tags": infer_tags_from_text(title, abstract, keywords),
+        "text": text,
+    }
+
+
 def preview_text(text: str, fallback: str) -> str:
     clean = " ".join(text.split())
     if not clean:
@@ -111,17 +257,142 @@ def preview_text(text: str, fallback: str) -> str:
     return f"{clean[:357]}..."
 
 
+def split_query_terms(query: str) -> list[str]:
+    terms = []
+    for token in re.findall(r"[A-Za-z0-9]+", query.lower()):
+        if len(token) >= 3 and token not in terms:
+            terms.append(token)
+    return terms
+
+
 def build_summary(title: str, abstract: str, extracted_text: str | None) -> str:
-    source = " ".join((extracted_text or abstract).split())
-    if not source:
-        source = abstract
-    sentences = [part.strip() for part in source.replace("\n", " ").split(".") if part.strip()]
-    highlights = sentences[:3] or [abstract]
-    bullets = " ".join(f"{index + 1}. {sentence}." for index, sentence in enumerate(highlights))
+    if extracted_text:
+        parsed = parse_uploaded_paper_metadata(extracted_text, title)
+        abstract = str(parsed["abstract"] or abstract)
+    sentences = split_sentences(abstract)
+    chosen = []
+    for matcher in [
+        lambda s: "we propose" in s.lower() or "we develop" in s.lower(),
+        lambda s: "graph structure" in s.lower() or "embedding process" in s.lower() or "framework" in s.lower(),
+        lambda s: "experiments" in s.lower() or "demonstrating" in s.lower() or "improvements" in s.lower(),
+    ]:
+        sentence = next((s for s in sentences if matcher(s) and s not in chosen), None)
+        if sentence:
+            chosen.append(sentence)
+    highlights = chosen or sentences[:3] or [abstract]
+    bullets = " ".join(f"{index + 1}. {sentence}" for index, sentence in enumerate(highlights))
     return (
         f"Summary for {title}: {bullets} "
-        "For the demo, this backend uses extracted paper text when available and produces a concise local summary."
+        "This summary is generated from the paper abstract and extracted PDF content."
     )
+
+
+def call_openai_assistant(message: str, paper_context: str | None = None) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    system_prompt = (
+        "You are ResearchAI, a helpful academic research assistant. "
+        "Answer clearly, accurately, and simply. "
+        "If the user asks about AI concepts such as RAG, tokenization, transformers, or generative AI, explain them like a smart tutor. "
+        "If paper context is provided, ground the answer in that paper."
+    )
+    if paper_context:
+        user_input = f"Paper context:\n{paper_context}\n\nUser question:\n{message}"
+    else:
+        user_input = message
+
+    payload = json.dumps(
+        {
+            "model": model,
+            "instructions": system_prompt,
+            "input": user_input,
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if body.get("output_text"):
+            return body["output_text"].strip()
+        for item in body.get("output", []):
+            if item.get("type") == "message":
+                for content in item.get("content", []):
+                    if content.get("type") == "output_text":
+                        text = content.get("text", "").strip()
+                        if text:
+                            return text
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def call_gemini_assistant(message: str, paper_context: str | None = None) -> str | None:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    system_prompt = (
+        "You are ResearchAI, a helpful academic research assistant. "
+        "Answer clearly, accurately, and simply. "
+        "If the user asks about AI concepts such as RAG, tokenization, transformers, or generative AI, explain them like a smart tutor. "
+        "If paper context is provided, ground the answer in that paper."
+    )
+    if paper_context:
+        user_input = f"Paper context:\n{paper_context}\n\nUser question:\n{message}"
+    else:
+        user_input = message
+
+    payload = json.dumps(
+        {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [
+                {
+                    "parts": [
+                        {"text": user_input}
+                    ]
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        for candidate in body.get("candidates", []):
+            content = candidate.get("content", {})
+            for part in content.get("parts", []):
+                text = part.get("text", "").strip()
+                if text:
+                    return text
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        return None
+    return None
 
 
 def source_for_paper(row) -> str:
@@ -163,9 +434,13 @@ def list_papers(status: str | None = None, q: str | None = None) -> list[Paper]:
         query += " AND status = ?"
         params.append(status)
     if q:
-        query += " AND (title LIKE ? OR authors LIKE ? OR abstract LIKE ? OR tags LIKE ?)"
-        needle = f"%{q}%"
-        params.extend([needle, needle, needle, needle])
+        terms = split_query_terms(q) or [q.strip().lower()]
+        clauses = []
+        for term in terms:
+            needle = f"%{term}%"
+            clauses.append("(LOWER(title) LIKE ? OR LOWER(authors) LIKE ? OR LOWER(abstract) LIKE ? OR LOWER(tags) LIKE ?)")
+            params.extend([needle, needle, needle, needle])
+        query += f" AND ({' OR '.join(clauses)})"
     query += " ORDER BY id ASC"
 
     with get_connection() as conn:
@@ -206,11 +481,15 @@ def upload_paper(file: UploadFile = File(...)) -> Paper:
         copyfileobj(file.file, output)
 
     extracted_text = extract_pdf_text(destination)
-    title = Path(file.filename).stem.replace("_", " ").replace("-", " ").title()
-    abstract = preview_text(
+    parsed = parse_uploaded_paper_metadata(
         extracted_text,
-        "This uploaded paper is stored locally. Text extraction did not find readable text, but the paper is ready for summary and chat demo flows.",
+        Path(file.filename).stem.replace("_", " ").replace("-", " ").title(),
     )
+    title = str(parsed["title"])
+    authors = str(parsed["authors"])
+    year = parsed["year"]
+    abstract = str(parsed["abstract"])
+    tags = ",".join(parsed["tags"])
     with get_connection() as conn:
         cursor = conn.execute(
             """
@@ -219,10 +498,10 @@ def upload_paper(file: UploadFile = File(...)) -> Paper:
             """,
             (
                 title,
-                "Uploaded PDF",
-                None,
+                authors,
+                year,
                 abstract,
-                "Uploaded,PDF",
+                tags,
                 "To Read",
                 "Local Upload",
                 str(destination),
@@ -314,32 +593,40 @@ def summarize_paper(paper_id: int) -> SummaryResponse:
 @app.get("/papers/{paper_id}/insights", response_model=PaperInsights)
 def paper_insights(paper_id: int) -> PaperInsights:
     row = get_paper_or_404(paper_id)
-    tags = [tag.strip() for tag in row["tags"].split(",") if tag.strip()]
-    topic = tags[0] if tags else "the selected research problem"
-    source = source_for_paper(row)
-    core_sentence = first_sentence(source, row["abstract"])
+    parsed = parse_uploaded_paper_metadata(row["extracted_text"], row["title"]) if row["extracted_text"] else None
+    title = str(parsed["title"]) if parsed else row["title"]
+    abstract = str(parsed["abstract"]) if parsed else row["abstract"]
+    tags = list(parsed["tags"]) if parsed else [tag.strip() for tag in row["tags"].split(",") if tag.strip()]
+    topic = tags[0] if tags else title
+    sentences = split_sentences(abstract)
+    objective_sentence = next((s for s in sentences if "we propose" in s.lower() or "we develop" in s.lower() or "we aim" in s.lower()), first_sentence(abstract, row["abstract"]))
+    methodology_sentence = next((s for s in sentences if "graph structure" in s.lower() or "propagat" in s.lower() or "embedding" in s.lower()), first_sentence(abstract, row["abstract"]))
+    findings_sentence = next((s for s in sentences if "experiments" in s.lower() or "improvement" in s.lower() or "demonstrat" in s.lower()), first_sentence(abstract, row["abstract"]))
+    dataset_sentence = next((s for s in sentences if "benchmark" in s.lower() or "dataset" in s.lower()), "The abstract does not name specific datasets in the extracted section.")
     return PaperInsights(
         paper_id=paper_id,
-        objective=f"Understand and improve research around {topic}. The paper begins from this central idea: {core_sentence}.",
-        methodology=f"The work uses concepts related to {', '.join(tags[:3]) or 'paper analysis'} and studies how the proposed approach addresses the research problem.",
-        dataset="The available metadata does not specify a dataset clearly; for demo purposes, the system flags this as something to verify while reading the full paper.",
-        key_findings=f"The paper's main contribution is that it advances {topic} and provides a useful baseline for related work.",
-        limitations="The demo analysis suggests checking for evaluation scope, dataset diversity, reproducibility details, and comparison against recent methods.",
-        future_scope=f"Future work can extend this direction by applying the method to broader domains, improving evaluation, and comparing it with newer {topic} techniques.",
+        objective=f"This paper targets {topic.lower()} in recommendation systems. Core objective: {objective_sentence}",
+        methodology=f"Method in brief: {methodology_sentence}",
+        dataset=f"Experimental setup clue: {dataset_sentence}",
+        key_findings=f"Key finding: {findings_sentence}",
+        limitations="From the extracted abstract alone, likely limitations to verify in the full paper are scalability, robustness across datasets, and comparison against newer graph recommendation models.",
+        future_scope=f"Future work can extend {title} by testing stronger graph architectures, larger benchmarks, and better explainability for recommendation decisions.",
     )
 
 
 @app.get("/papers/{paper_id}/research-gap", response_model=ResearchGapResponse)
 def research_gap(paper_id: int) -> ResearchGapResponse:
     row = get_paper_or_404(paper_id)
-    tags = [tag.strip() for tag in row["tags"].split(",") if tag.strip()]
-    topic = tags[0] if tags else "this topic"
+    parsed = parse_uploaded_paper_metadata(row["extracted_text"], row["title"]) if row["extracted_text"] else None
+    title = str(parsed["title"]) if parsed else row["title"]
+    tags = list(parsed["tags"]) if parsed else [tag.strip() for tag in row["tags"].split(",") if tag.strip()]
+    topic = tags[0] if tags else title
     secondary = tags[1] if len(tags) > 1 else "real-world evaluation"
     return ResearchGapResponse(
         paper_id=paper_id,
-        gap=f"The paper discusses {topic}, but there is room to explore how well the approach works across diverse datasets, low-resource settings, and practical deployment constraints.",
-        opportunity=f"A strong project extension would compare {topic} methods with newer approaches and measure performance, explainability, and user usefulness.",
-        possible_title=f"Improving {topic} Research Through {secondary} and Explainable Evaluation",
+        gap=f"{title} shows strong results, but there is still room to study how this approach behaves under larger-scale, noisier, or more dynamic recommendation settings beyond the reported benchmarks.",
+        opportunity=f"A strong extension would compare this {topic.lower()} approach with newer graph-based recommenders and study scalability, cold-start behavior, and explainability.",
+        possible_title=f"Extending {title} with {secondary} Analysis and Scalable Evaluation",
     )
 
 
@@ -391,6 +678,9 @@ def chat(payload: ChatRequest) -> ChatResponse:
         if paper:
             source = paper["extracted_text"] or paper["abstract"]
             snippet = preview_text(source, paper["abstract"])
+            llm_answer = call_gemini_assistant(message, paper_context=source[:8000]) or call_openai_assistant(message, paper_context=source[:8000])
+            if llm_answer:
+                answer = llm_answer
             if "summary" in lower_message or "summarize" in lower_message:
                 answer = build_summary(paper["title"], paper["abstract"], paper["extracted_text"])
             elif "simple" in lower_message or "explain" in lower_message:
@@ -398,7 +688,7 @@ def chat(payload: ChatRequest) -> ChatResponse:
                     f"In simple terms, '{paper['title']}' is about this idea: {paper['abstract']} "
                     "It matters because it helps researchers understand the method, result, or direction more quickly."
                 )
-            else:
+            elif not llm_answer:
                 answer = (
                     f"Based on '{paper['title']}', the most relevant content I found is: {snippet} "
                     "For the demo, this answer is generated from the stored paper abstract or extracted PDF text."
@@ -406,23 +696,79 @@ def chat(payload: ChatRequest) -> ChatResponse:
         else:
             answer = "I could not find that paper yet."
     else:
+        llm_answer = call_gemini_assistant(message) or call_openai_assistant(message)
+        if llm_answer:
+            answer = llm_answer
         with get_connection() as conn:
             library = conn.execute(
-                "SELECT title, status FROM papers WHERE status IN ('To Read', 'Reading', 'Completed') ORDER BY id LIMIT 5"
+                "SELECT title, status, tags, abstract FROM papers WHERE status IN ('To Read', 'Reading', 'Completed') ORDER BY id LIMIT 5"
             ).fetchall()
             recommended = conn.execute(
                 "SELECT title FROM papers WHERE status = 'Recommended' ORDER BY citations DESC LIMIT 3"
             ).fetchall()
-        if "suggest" in lower_message or "next" in lower_message or "related" in lower_message:
+        if not llm_answer and ("rag" in lower_message or "retrieval-augmented generation" in lower_message):
+            answer = (
+                "RAG stands for Retrieval-Augmented Generation. Instead of answering only from a model's internal memory, "
+                "it first retrieves relevant text chunks from documents, then uses those chunks to generate a grounded answer. "
+                "In your project, the pipeline is: upload paper -> extract text -> store useful sections -> match the user's question to relevant sections -> generate an answer from that retrieved context."
+            )
+        elif not llm_answer and ("generative ai" in lower_message or "gen ai" in lower_message):
+            answer = (
+                "Generative AI is a type of artificial intelligence that creates new content such as text, images, audio, or code based on patterns learned from data. "
+                "Large language models are a form of generative AI because they generate human-like text in response to prompts."
+            )
+        elif not llm_answer and "tokenization" in lower_message:
+            answer = (
+                "Tokenization is the process of breaking text into smaller units called tokens. "
+                "A token can be a word, part of a word, or punctuation depending on the tokenizer. "
+                "Language models read and generate tokens, not full sentences all at once."
+            )
+        elif not llm_answer and ("transformer" in lower_message or "transformers" in lower_message):
+            answer = (
+                "A Transformer is a neural network architecture that uses attention mechanisms to understand relationships between words or tokens in a sequence. "
+                "It became the foundation for modern language models because it handles context well and scales effectively."
+            )
+        elif not llm_answer and "pipeline" in lower_message:
+            answer = (
+                "Your current ResearchAI pipeline is: collect or upload papers, save metadata and extracted text, generate summaries and insight panels, allow paper-specific chat, and recommend related papers based on topic overlap. "
+                "If you want a cleaner explanation in demo terms: input papers, process content, generate understanding, then support discovery."
+            )
+        elif not llm_answer and "compare" in lower_message:
+            if len(library) >= 2:
+                first, second = library[0], library[1]
+                answer = (
+                    f"A simple comparison is between '{first['title']}' and '{second['title']}'. "
+                    f"The first focuses on {first['abstract'].lower()} while the second focuses on {second['abstract'].lower()} "
+                    "A good comparison framework is: objective, method, strengths, limitations, and future work."
+                )
+            else:
+                answer = "Save at least two papers in My Papers and I can help compare their objectives, methods, and findings."
+        elif not llm_answer and ("literature review" in lower_message or "review" in lower_message):
+            titles = ", ".join(row["title"] for row in library[:3])
+            answer = (
+                f"A literature review connects multiple papers into one academic narrative. In your app, you can select papers such as {titles} "
+                "and generate a review that explains the common theme, progression of methods, and open research gap."
+            )
+        elif not llm_answer and ("research gap" in lower_message or "gap" in lower_message):
+            answer = (
+                "A research gap is the part of a topic that existing papers have not fully explored yet. "
+                "In your project, the Research Gap feature looks at the paper topic, methods, and limitations, then suggests a future direction or possible title for new work."
+            )
+        elif not llm_answer and ("suggest" in lower_message or "next" in lower_message or "related" in lower_message):
             titles = ", ".join(row["title"] for row in recommended)
             answer = f"Based on your library, good next reads are: {titles}."
-        elif "summarize" in lower_message or "saved" in lower_message:
+        elif not llm_answer and ("summarize" in lower_message or "saved" in lower_message):
             titles = ", ".join(f"{row['title']} ({row['status']})" for row in library)
             answer = f"Your saved paper set includes: {titles}. Open a specific paper and click Summary for a paper-level summary."
-        else:
+        elif not llm_answer and ("methodology" in lower_message or "method" in lower_message):
             answer = (
-                "I can summarize saved papers, find related work, compare papers, and suggest what to read next. "
-                "For grounded answers, open a paper from My Papers and ask about that paper."
+                "When explaining methodology, focus on what approach the paper uses, what data or setup it applies, and why that method was chosen. "
+                "Your Paper Insight Panel already organizes this into objective, methodology, findings, limitations, and future scope."
+            )
+        elif not llm_answer:
+            answer = (
+                "I can explain RAG, compare papers, summarize saved papers, suggest related work, describe research gaps, and help you understand methodology. "
+                "For grounded answers about a specific paper, open it from My Papers and ask inside the paper chat."
             )
 
     with get_connection() as conn:

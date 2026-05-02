@@ -1,0 +1,13 @@
+backend/data/
+backend/uploads/
+frontend/dist/
+frontend/node_modules/
+__pycache__/
+*.pyc
+*.log
+.venv/
+.env
+backend.env
+backend/.env
+outputs/
+tools/template-inspect.txt

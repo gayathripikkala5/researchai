@@ -44,6 +44,17 @@ const navItems = [
 
 const statusFilters = ["All", "Reading", "Completed", "To Read"];
 
+function cleanGeneratedText(text) {
+  if (!text) return "";
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\*\*/g, "")
+    .replace(/^\s*["']|["']\s*$/g, "")
+    .replace(/^\s*[\*\-]\s+/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function formatCitations(count) {
   return `${Number(count || 0).toLocaleString()} citations`;
 }
@@ -212,12 +223,19 @@ function SearchPapers({ papers, onSearch, query, setQuery, onStatus, onView }) {
           />
         </div>
       </div>
-      <h2 className="section-title hot">Trending Papers</h2>
-      <div className="stack-list">
-        {papers.map((paper) => (
-          <PaperCard key={paper.id} paper={paper} showSave onStatus={onStatus} onView={onView} />
-        ))}
-      </div>
+      <h2 className="section-title">Trending Papers</h2>
+      {papers.length === 0 ? (
+        <div className="feature-panel empty-panel">
+          <h2>No matching papers found</h2>
+          <p>Try a shorter keyword or search with terms like transformer, graph, recommendation, language, or bert.</p>
+        </div>
+      ) : (
+        <div className="stack-list">
+          {papers.map((paper) => (
+            <PaperCard key={paper.id} paper={paper} showSave onStatus={onStatus} onView={onView} />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
@@ -311,7 +329,7 @@ function Assistant() {
                 <Bot size={15} />
               </div>
             )}
-            <p>{message.content}</p>
+            <p>{message.role === "assistant" ? cleanGeneratedText(message.content) : message.content}</p>
           </div>
         ))}
       </div>
@@ -525,7 +543,7 @@ function PaperDetailModal({
         {summary && (
           <>
             <p className="detail-label">AI Summary</p>
-            <p className="detail-text summary-box">{summary}</p>
+            <p className="detail-text summary-box">{cleanGeneratedText(summary)}</p>
           </>
         )}
         {insights && (
@@ -582,7 +600,7 @@ function PaperDetailModal({
               />
               <button className="btn muted" disabled={chatBusy}>{chatBusy ? "Thinking..." : "Ask"}</button>
             </form>
-            {paperChat && <p className="detail-text summary-box">{paperChat}</p>}
+            {paperChat && <p className="detail-text summary-box">{cleanGeneratedText(paperChat)}</p>}
           </section>
         </div>
       </div>
@@ -631,6 +649,7 @@ function UploadModal({ onClose, onUploaded }) {
 export default function App() {
   const [activePage, setActivePage] = useState("Dashboard");
   const [papers, setPapers] = useState([]);
+  const [searchResults, setSearchResults] = useState([]);
   const [recommendations, setRecommendations] = useState([]);
   const [filter, setFilter] = useState("All");
   const [query, setQuery] = useState("");
@@ -657,6 +676,7 @@ export default function App() {
   async function refresh() {
     const [paperData, recommendationData] = await Promise.all([getPapers(), getRecommendations()]);
     setPapers(paperData);
+    setSearchResults(paperData);
     setRecommendations(recommendationData);
   }
 
@@ -665,8 +685,9 @@ export default function App() {
   }, []);
 
   async function searchPapers(value) {
-    const data = await getPapers({ q: value });
-    setPapers(data);
+    const clean = value.trim();
+    const data = clean ? await getPapers({ q: clean }) : await getPapers();
+    setSearchResults(data);
   }
 
   async function handleStatus(id, status) {
@@ -754,7 +775,7 @@ export default function App() {
 
   const pages = {
     Dashboard: <Dashboard papers={papers} onUploadClick={() => setShowUpload(true)} onView={handleView} />,
-    "Search Papers": <SearchPapers papers={papers} query={query} setQuery={setQuery} onSearch={searchPapers} onStatus={handleStatus} onView={handleView} />,
+    "Search Papers": <SearchPapers papers={searchResults} query={query} setQuery={setQuery} onSearch={searchPapers} onStatus={handleStatus} onView={handleView} />,
     "My Papers": <MyPapers papers={papers} filter={filter} setFilter={setFilter} onDelete={handleDelete} onSummary={handleSummary} onView={handleView} />,
     "AI Assistant": <Assistant />,
     Recommendations: <Recommendations recommendations={recommendations} onStatus={handleStatus} onView={handleView} />,
