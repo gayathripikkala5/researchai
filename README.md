@@ -1,5 +1,5 @@
 # ResearchAI
-
+researchai-frontend.vercel.app THIS IS LINK TO OPEN.
 ResearchAI is a full-stack research paper tracking and recommendation tool designed to help students, researchers, and academic users manage papers more efficiently. The system allows users to search papers, upload PDFs, organize their reading workflow, generate summaries, chat with papers, discover related work, and produce short literature reviews from selected papers.
 
 ## Problem Statement
